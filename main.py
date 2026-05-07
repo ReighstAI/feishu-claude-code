@@ -631,6 +631,12 @@ async def _run_and_display(
             with open(plan_file_path, "r") as f:
                 plan_content = f.read()
             if plan_content.strip():
+                # Strip markdown tables — Feishu has a card-wide table count limit
+                clean = re.sub(
+                    r'^\|.*\|$\n?(?:^\|[-:| ]+\|$\n?)?(?:^\|.*\|$\n?)*',
+                    '（表格已省略，见方案文件）\n',
+                    plan_content, flags=re.MULTILINE,
+                )
                 plan_panel = {
                     "tag": "collapsible_panel",
                     "expanded": True,
@@ -645,7 +651,7 @@ async def _run_and_display(
                     "border": {"color": "blue", "corner_radius": "8px"},
                     "vertical_spacing": "8px",
                     "elements": [{"tag": "markdown", "content": chunk}
-                                 for chunk in _chunk_markdown(plan_content, 2800)],
+                                 for chunk in _chunk_markdown(clean, 2800)],
                 }
                 insert_idx = 0
                 for i, el in enumerate(elements):
