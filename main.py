@@ -625,42 +625,27 @@ async def _run_and_display(
     # Build structured final card
     elements = _build_card_elements(tool_history, final, is_final=True)
 
-    # Embed plan content if plan file was written
+    # Plan file → create Feishu doc + link in card (not inline — avoids table/size limits)
+    plan_doc_url = ""
     if plan_file_path:
         try:
             with open(plan_file_path, "r") as f:
                 plan_content = f.read()
             if plan_content.strip():
-                # Strip markdown tables — Feishu has a card-wide table count limit
-                clean = re.sub(
-                    r'^\|.*\|$\n?(?:^\|[-:| ]+\|$\n?)?(?:^\|.*\|$\n?)*',
-                    '（表格已省略，见方案文件）\n',
-                    plan_content, flags=re.MULTILINE,
-                )
-                plan_panel = {
-                    "tag": "collapsible_panel",
-                    "expanded": True,
-                    "header": {
-                        "title": {"tag": "plain_text",
-                                  "content": "📋 方案" + ("（待审核）" if plan_exited else "")},
-                        "icon": {"tag": "standard_icon", "token": "down-small-ccm_outlined",
-                                 "size": "16px 16px"},
-                        "icon_position": "right",
-                        "icon_expanded_angle": -180,
-                    },
-                    "border": {"color": "blue", "corner_radius": "8px"},
-                    "vertical_spacing": "8px",
-                    "elements": [{"tag": "markdown", "content": chunk}
-                                 for chunk in _chunk_markdown(clean, 2800)],
-                }
-                insert_idx = 0
-                for i, el in enumerate(elements):
-                    if el.get("tag") == "hr":
-                        insert_idx = i + 1
-                        break
-                elements.insert(insert_idx, plan_panel)
+                plan_title = "📋 方案" + (" — 待审核" if plan_exited else "")
+                plan_doc_url = await feishu.create_plan_doc(plan_title, plan_content)
+                print(f"[Plan] doc created: {plan_doc_url}", flush=True)
         except Exception as e:
-            print(f"[Plan] failed to read plan file: {e}", flush=True)
+            print(f"[Plan] failed to create plan doc: {e}", flush=True)
+
+    if plan_doc_url:
+        plan_link = {"tag": "markdown", "content": f"📋 [点击查看完整方案]({plan_doc_url})"}
+        insert_idx = 0
+        for i, el in enumerate(elements):
+            if el.get("tag") == "hr":
+                insert_idx = i + 1
+                break
+        elements.insert(insert_idx, plan_link)
 
     # Add option buttons if detected
     options = _extract_options(final) or ask_options

@@ -392,3 +392,65 @@ class FeishuClient:
         resp = await self.client.im.v1.message_reaction.acreate(req)
         if not resp.success():
             raise RuntimeError(f"添加 reaction 失败: {resp.code} {resp.msg}")
+
+    async def create_plan_doc(self, title: str, content: str, feishu_domain: str = "w6ht0l1fw6") -> str:
+        """创建飞书文档并写入内容，返回文档 URL。内容按段落分块写入。"""
+        from lark_oapi.api.docx.v1.model import (
+            CreateDocumentRequest,
+            CreateDocumentRequestBody,
+            CreateDocumentBlockChildrenRequest,
+            CreateDocumentBlockChildrenRequestBody,
+            Block,
+        )
+
+        def _create_sync() -> str:
+            # 1. Create empty doc
+            req = (
+                CreateDocumentRequest.builder()
+                .request_body(CreateDocumentRequestBody.builder().title(title).build())
+                .build()
+            )
+            resp = self.client.docx.v1.document.create(req)
+            if not resp.success():
+                raise RuntimeError(f"创建文档失败: {resp.code} {resp.msg}")
+            doc_id = resp.data.document.document_id
+
+            # 2. Add content as text blocks (split by paragraphs, max ~3000 chars per block)
+            paragraphs = content.split('\n\n')
+            chunks = []
+            current = ""
+            for p in paragraphs:
+                if len(current) + len(p) + 2 > 3000:
+                    if current:
+                        chunks.append(current)
+                    current = p
+                else:
+                    current = current + "\n\n" + p if current else p
+            if current:
+                chunks.append(current)
+
+            for chunk in chunks:
+                block = (
+                    Block.builder()
+                    .block_type(2)  # 2 = text block
+                    .text({"elements": [{"text_run": {"content": chunk}}]})
+                    .build()
+                )
+                add_req = (
+                    CreateDocumentBlockChildrenRequest.builder()
+                    .document_id(doc_id)
+                    .block_id(doc_id)
+                    .request_body(
+                        CreateDocumentBlockChildrenRequestBody.builder()
+                        .children([block])
+                        .build()
+                    )
+                    .build()
+                )
+                add_resp = self.client.docx.v1.document_block_children.create(add_req)
+                if not add_resp.success():
+                    print(f"[warn] add block failed: {add_resp.code} {add_resp.msg}", flush=True)
+
+            return f"https://{feishu_domain}.feishu.cn/docx/{doc_id}"
+
+        return await asyncio.to_thread(_create_sync)
