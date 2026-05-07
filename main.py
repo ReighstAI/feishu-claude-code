@@ -625,41 +625,49 @@ async def _run_and_display(
     # Build structured final card
     elements = _build_card_elements(tool_history, final, is_final=True)
 
-    # Plan file → Feishu doc via feishu.py (proper markdown rendering)
+    # Plan file → Feishu doc (try feishu.py for markdown rendering, fallback to SDK)
     plan_doc_url = ""
     if plan_file_path:
-        try:
-            import shutil, subprocess
-            bridge_dir = os.path.dirname(os.path.abspath(__file__))
-            tmp_plan = os.path.join(bridge_dir, "_plan_tmp.md")
-            shutil.copy2(plan_file_path, tmp_plan)
+        plan_title = "📋 方案" + (" — 待审核" if plan_exited else "")
+        # Try feishu.py first (proper markdown rendering with tables, headers, code blocks)
+        feishu_py = os.path.join(config.DEFAULT_CWD, "scripts", "feishu.py")
+        if os.path.exists(feishu_py):
             try:
-                plan_title = "📋 方案" + (" — 待审核" if plan_exited else "")
-                feishu_py = os.path.join(config.DEFAULT_CWD, "scripts", "feishu.py")
-                result = await asyncio.to_thread(
-                    lambda: subprocess.run(
-                        ["python3", feishu_py, "doc", "create",
-                         "--title", plan_title, "--content", "./_plan_tmp.md", "--no-send"],
-                        capture_output=True, text=True, cwd=bridge_dir,
-                    )
-                )
-                for line in result.stdout.splitlines():
-                    if "doc created:" in line:
-                        plan_doc_url = line.split("doc created:")[-1].strip()
-                        break
-                if plan_doc_url:
-                    print(f"[Plan] doc created: {plan_doc_url}", flush=True)
-                else:
-                    print(f"[Plan] feishu.py output: {result.stdout[:200]}", flush=True)
-                    if result.stderr:
-                        print(f"[Plan] stderr: {result.stderr[:200]}", flush=True)
-            finally:
+                import shutil, subprocess
+                bridge_dir = os.path.dirname(os.path.abspath(__file__))
+                tmp_plan = os.path.join(bridge_dir, "_plan_tmp.md")
+                shutil.copy2(plan_file_path, tmp_plan)
                 try:
-                    os.remove(tmp_plan)
-                except Exception:
-                    pass
-        except Exception as e:
-            print(f"[Plan] failed to create plan doc: {e}", flush=True)
+                    result = await asyncio.to_thread(
+                        lambda: subprocess.run(
+                            ["python3", feishu_py, "doc", "create",
+                             "--title", plan_title, "--content", "./_plan_tmp.md", "--no-send"],
+                            capture_output=True, text=True, cwd=bridge_dir,
+                        )
+                    )
+                    for line in result.stdout.splitlines():
+                        if "doc created:" in line:
+                            plan_doc_url = line.split("doc created:")[-1].strip()
+                            break
+                    if plan_doc_url:
+                        print(f"[Plan] doc created via feishu.py: {plan_doc_url}", flush=True)
+                finally:
+                    try:
+                        os.remove(tmp_plan)
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"[Plan] feishu.py failed: {e}", flush=True)
+        # Fallback: lark SDK direct (plain text, no markdown rendering, but works everywhere)
+        if not plan_doc_url:
+            try:
+                with open(plan_file_path, "r") as f:
+                    plan_content = f.read()
+                if plan_content.strip():
+                    plan_doc_url = await feishu.create_plan_doc(plan_title, plan_content)
+                    print(f"[Plan] doc created via SDK fallback: {plan_doc_url}", flush=True)
+            except Exception as e:
+                print(f"[Plan] SDK fallback also failed: {e}", flush=True)
 
     if plan_doc_url:
         plan_link = {"tag": "markdown", "content": f"📋 [点击查看完整方案]({plan_doc_url})"}
