@@ -41,6 +41,9 @@ class ActiveRunRegistry:
             return
         self._runs.pop(user_id, None)
 
+    def has_active_runs(self) -> bool:
+        return bool(self._runs)
+
 
 async def _maybe_await(result):
     if asyncio.iscoroutine(result):

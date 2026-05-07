@@ -189,3 +189,150 @@ def test_run_claude_fires_tool_use_callback(monkeypatch):
     assert len(tool_calls) == 2
     assert tool_calls[0] == ("Bash", {})
     assert tool_calls[1] == ("Bash", {"command": "ls"})
+
+
+# ── SDK envelope handling (post-4.7 stream-json format) ─────────────────────
+
+
+def test_run_claude_assistant_text_envelope_does_not_duplicate_text(monkeypatch):
+    """type:'assistant' with text content arrives alongside content_block_delta.
+    Firing on_text_chunk for BOTH would double the card content. The runner must
+    forward text ONLY via content_block_delta, and IGNORE assistant text envelopes.
+    """
+    proc = FakeProc([
+        b'{"type":"system","session_id":"sid_1"}\n',
+        b'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}}\n',
+        # Top-level assistant envelope with the SAME text — must NOT fire another chunk
+        b'{"type":"assistant","parent_tool_use_id":null,"message":{"type":"message","content":[{"type":"text","text":"Hello"}]}}\n',
+        b'{"type":"result","session_id":"sid_1","result":"Hello"}\n',
+    ])
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    chunks = []
+
+    async def collect_chunk(chunk):
+        chunks.append(chunk)
+
+    text, _, _ = asyncio.run(run_claude("hi", on_text_chunk=collect_chunk))
+
+    # Only ONE chunk (from content_block_delta), not two
+    assert chunks == ["Hello"]
+    assert text == "Hello"
+
+
+def test_run_claude_subagent_tool_use_fires_subagent_heartbeat(monkeypatch):
+    """When the main agent spawns a subagent via the Agent tool, the subagent's
+    internal tool_use events arrive as type:'assistant' with parent_tool_use_id set.
+    The runner must forward these as [subagent]-prefixed on_tool_use calls so the
+    Feishu card has a heartbeat while the subagent runs.
+    """
+    proc = FakeProc([
+        b'{"type":"system","session_id":"sid_1"}\n',
+        # Main agent spawns the Agent tool (handled via stream_event elsewhere)
+        # Subagent's INTERIOR tool_use — this is what we need to surface
+        b'{"type":"assistant","parent_tool_use_id":"toolu_ABC","message":{"type":"message","content":[{"type":"tool_use","name":"Glob","input":{"pattern":"**/*.md"}}]}}\n',
+        b'{"type":"result","session_id":"sid_1","result":"done"}\n',
+    ])
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    tool_calls = []
+
+    async def collect_tool(name, inp):
+        tool_calls.append((name, inp))
+
+    text, _, _ = asyncio.run(run_claude("hi", on_tool_use=collect_tool))
+
+    # Subagent tool_use must be surfaced with [subagent] prefix
+    assert tool_calls == [("[subagent] Glob", {"pattern": "**/*.md"})]
+
+
+def test_run_claude_user_tool_result_from_subagent_fires_progress_heartbeat(monkeypatch):
+    """tool_result envelopes inside a subagent arrive as type:'user' with
+    parent_tool_use_id set. The runner must fire a lightweight progress heartbeat
+    so the card updates when the subagent works through multiple tools.
+    Main-agent (parent_tool_use_id=null) tool_results must NOT fire extra events.
+    """
+    proc = FakeProc([
+        b'{"type":"system","session_id":"sid_1"}\n',
+        # Subagent tool_result — fire heartbeat
+        b'{"type":"user","parent_tool_use_id":"toolu_ABC","message":{"role":"user","content":[{"type":"tool_result","content":"stuff"}]}}\n',
+        # Main agent tool_result — do NOT fire
+        b'{"type":"user","parent_tool_use_id":null,"message":{"role":"user","content":[{"type":"tool_result","content":"stuff"}]}}\n',
+        b'{"type":"result","session_id":"sid_1","result":"done"}\n',
+    ])
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    tool_calls = []
+
+    async def collect_tool(name, inp):
+        tool_calls.append((name, inp))
+
+    asyncio.run(run_claude("hi", on_tool_use=collect_tool))
+
+    # Exactly one heartbeat for the subagent, nothing for the main-agent result
+    assert tool_calls == [("[subagent] ⏳", {})]
+
+
+def test_run_claude_rate_limit_event_ignored_silently(monkeypatch):
+    """rate_limit_event envelopes are informational; must not crash or fire callbacks."""
+    proc = FakeProc([
+        b'{"type":"system","session_id":"sid_1"}\n',
+        b'{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"},"session_id":"sid_1"}\n',
+        b'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}}\n',
+        b'{"type":"result","session_id":"sid_1","result":"ok"}\n',
+    ])
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    chunks = []
+    tool_calls = []
+
+    async def collect_chunk(chunk):
+        chunks.append(chunk)
+
+    async def collect_tool(name, inp):
+        tool_calls.append((name, inp))
+
+    text, _, _ = asyncio.run(
+        run_claude("hi", on_text_chunk=collect_chunk, on_tool_use=collect_tool)
+    )
+
+    assert text == "ok"
+    assert chunks == ["ok"]
+    assert tool_calls == []
+
+
+def test_run_claude_unknown_event_type_does_not_break_stream(monkeypatch, capsys):
+    """Unknown envelope types must be logged (for observability) but not crash the stream."""
+    proc = FakeProc([
+        b'{"type":"system","session_id":"sid_1"}\n',
+        b'{"type":"some_future_envelope","anything":"goes"}\n',
+        b'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"after"}}}\n',
+        b'{"type":"result","session_id":"sid_1","result":"after"}\n',
+    ])
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    text, _, _ = asyncio.run(run_claude("hi"))
+
+    assert text == "after"
+    out = capsys.readouterr().out
+    assert "unknown event_type='some_future_envelope'" in out

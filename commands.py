@@ -34,10 +34,17 @@ MODE_ALIASES = {
 }
 
 MODEL_ALIASES = {
-    "opus": "claude-opus-4-6",
+    "opus": "claude-opus-4-7[1m]",
+    "opus-4.7": "claude-opus-4-7[1m]",
+    "opus4.7": "claude-opus-4-7[1m]",
+    "opus-4.6": "claude-opus-4-6[1m]",
+    "opus4.6": "claude-opus-4-6[1m]",
     "sonnet": "claude-sonnet-4-6",
     "haiku": "claude-haiku-4-5-20251001",
 }
+
+# /effort levels (Claude CLI --effort: low, medium, high, xhigh, max)
+VALID_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 
 HELP_TEXT = """\
 📖 **可用命令**
@@ -47,7 +54,8 @@ HELP_TEXT = """\
 `/stop` — 停止当前正在运行的任务
 `/new` 或 `/clear` — 开始新 session
 `/resume` — 查看历史 sessions / `/resume [序号]` 恢复
-`/model [名称]` — 切换模型（opus / sonnet / haiku 或完整 ID）
+`/model [名称]` — 切换模型（opus-4.7 / opus-4.6 / sonnet / haiku 或完整 ID）
+`/effort [级别]` — 切换思考力度（low / medium / high / xhigh / max）
 `/mode [模式]` — 切换权限模式（default / plan / acceptEdits / bypassPermissions）
 `/status` — 显示当前 session 信息
 `/cd [路径]` — 切换工具执行的工作目录
@@ -86,7 +94,7 @@ def parse_command(text: str) -> Optional[Tuple[str, str]]:
 
 # Bot 自身处理的命令，其余 /xxx 转发给 Claude
 BOT_COMMANDS = {
-    "help", "h", "new", "clear", "resume", "model", "mode", "status", "cd", "ls",
+    "help", "h", "new", "clear", "resume", "model", "effort", "mode", "status", "cd", "ls",
     "workspace", "ws", "skills", "mcp", "usage", "stop",
 }
 
@@ -97,7 +105,7 @@ async def _build_session_list(user_id: str, chat_id: str, store: SessionStore, c
     cur_sid = (await store.get_current_raw(user_id, chat_id)).get("session_id")
 
     if cli_all is None:
-        cli_all = scan_cli_sessions(30)
+        cli_all = scan_cli_sessions(1000)
     cli_preview_map = {s["session_id"]: s for s in cli_all}
 
     feishu_sessions = [
@@ -126,7 +134,7 @@ async def _build_session_list(user_id: str, chat_id: str, store: SessionStore, c
             deduped.append(s)
 
     deduped.sort(key=lambda s: s.get("started_at", ""), reverse=True)
-    return deduped[:15]
+    return deduped
 
 
 def _strip_md(text: str) -> str:
@@ -146,7 +154,7 @@ async def _format_session_list(user_id: str, chat_id: str, store: SessionStore):
     cur = await store.get_current_raw(user_id, chat_id)
     cur_sid = cur.get("session_id")
 
-    cli_all = scan_cli_sessions(30)
+    cli_all = scan_cli_sessions(1000)
     cli_preview_map = {s["session_id"]: s for s in cli_all}
     all_sessions = await _build_session_list(user_id, chat_id, store, cli_all=cli_all)
 
@@ -193,11 +201,16 @@ async def _format_session_list(user_id: str, chat_id: str, store: SessionStore):
                    else cur.get("preview") or "")
         lines.append(f"当前：{_desc(cur_sid, preview)} ({_fmt_time(cur.get('started_at', ''))})")
 
-    lines.append(f"共 {len(all_sessions)} 个历史会话")
+    total = len(all_sessions)
+    display_n = min(total, 20)
+    if total > display_n:
+        lines.append(f"共 {total} 个历史会话（显示最近 {display_n}，更早用 /resume N）")
+    else:
+        lines.append(f"共 {total} 个历史会话")
 
     # 每个历史会话一个按钮
     buttons = []
-    for s in all_sessions[:10]:
+    for s in all_sessions[:display_n]:
         sid = s["session_id"]
         preview = s.get("preview", "")
         desc = _desc(sid, preview)
@@ -616,7 +629,8 @@ async def handle_command(
             return {
                 "text": f"当前模型：**{cur.model}**",
                 "buttons": [
-                    {"text": "🧠 Opus", "value": {"action": "run_cmd", "cmd": "/model opus", "cid": chat_id}},
+                    {"text": "🧠 Opus 4.7 1M", "value": {"action": "run_cmd", "cmd": "/model opus-4.7", "cid": chat_id}},
+                    {"text": "🧠 Opus 4.6 1M", "value": {"action": "run_cmd", "cmd": "/model opus-4.6", "cid": chat_id}},
                     {"text": "⚡ Sonnet", "value": {"action": "run_cmd", "cmd": "/model sonnet", "cid": chat_id}},
                     {"text": "🐇 Haiku", "value": {"action": "run_cmd", "cmd": "/model haiku", "cid": chat_id}},
                 ],
@@ -624,6 +638,25 @@ async def handle_command(
         model = MODEL_ALIASES.get(args.lower(), args)
         await store.set_model(user_id, chat_id, model)
         return f"✅ 已切换模型为 `{model}`"
+
+    elif cmd == "effort":
+        if not args:
+            cur = await store.get_current(user_id, chat_id)
+            return {
+                "text": f"当前 effort：**{cur.effort}**\n(思考力度：low < medium < high < xhigh < max)",
+                "buttons": [
+                    {"text": "🔥 max", "value": {"action": "run_cmd", "cmd": "/effort max", "cid": chat_id}},
+                    {"text": "⚡ xhigh", "value": {"action": "run_cmd", "cmd": "/effort xhigh", "cid": chat_id}},
+                    {"text": "🎯 high", "value": {"action": "run_cmd", "cmd": "/effort high", "cid": chat_id}},
+                    {"text": "🌓 medium", "value": {"action": "run_cmd", "cmd": "/effort medium", "cid": chat_id}},
+                    {"text": "💤 low", "value": {"action": "run_cmd", "cmd": "/effort low", "cid": chat_id}},
+                ],
+            }
+        level = args.lower().strip()
+        if level not in VALID_EFFORTS:
+            return f"❌ 未知 effort：`{args}`\n可选：{', '.join(f'`{e}`' for e in VALID_EFFORTS)}"
+        await store.set_effort(user_id, chat_id, level)
+        return f"✅ 已切换 effort 为 **{level}**"
 
     elif cmd == "status":
         cur = await store.get_current_raw(user_id, chat_id)
@@ -633,10 +666,12 @@ async def handle_command(
         workspace = cur.get("workspace") or "（未绑定）"
         started = cur.get("started_at", "")[:16].replace("T", " ")
         mode = cur.get("permission_mode") or "bypassPermissions"
+        effort = cur.get("effort", "max")
         return (
             f"📊 **当前 Session 状态**\n"
             f"Session ID: `{sid}`\n"
             f"模型: `{model}`\n"
+            f"Effort: `{effort}`\n"
             f"权限模式: `{mode}`\n"
             f"工作空间: `{workspace}`\n"
             f"工作目录: `{cwd}`\n"

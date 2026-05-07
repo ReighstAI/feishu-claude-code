@@ -9,9 +9,10 @@ FEISHU_APP_SECRET = os.environ["FEISHU_APP_SECRET"]
 
 CLAUDE_CLI = os.getenv("CLAUDE_CLI_PATH") or shutil.which("claude") or "claude"
 
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "claude-opus-4-6")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "claude-opus-4-6[1m]")
 DEFAULT_CWD = os.path.expanduser(os.getenv("DEFAULT_CWD", "~"))
 PERMISSION_MODE = os.getenv("PERMISSION_MODE", "bypassPermissions")
+DEFAULT_EFFORT = os.getenv("DEFAULT_EFFORT", "max")
 
 SESSIONS_DIR = os.path.expanduser("~/.feishu-claude")
 

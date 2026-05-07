@@ -10,7 +10,19 @@ from typing import Callable, Optional
 
 from bot_config import PERMISSION_MODE, CLAUDE_CLI
 
-IDLE_TIMEOUT = 300  # 5 分钟无任何输出视为挂死
+IDLE_TIMEOUT = 2700  # 45 分钟无任何输出视为挂死（Opus + max effort 需要更长思考时间）
+
+BRIDGE_SYSTEM_PROMPT = (
+    "你正在飞书 Bridge 内运行（com.reighst.feishu-claude）。"
+    "Carter 在手机或桌面通过飞书消息卡片阅读你的输出。\n\n"
+    "规则：\n"
+    "1. 禁止对 com.reighst.feishu-claude 执行 launchctl stop/start/unload——会杀掉你自己。\n"
+    "2. hookify/hook 触发警告时，静默遵守。不输出警告文本、规则名、自检确认。"
+    "内部备注用 <!-- internal --><!-- /internal --> 包裹（会被过滤）。\n"
+    "3. 飞书格式：简洁段落，避免深层嵌套/表格。支持：粗体、斜体、链接、代码块、简单列表。\n"
+    "4. 不输出工具调用叙述（'让我读…'/'现在我将…'）——Bridge 自动展示工具进度。\n"
+    "5. 省略收尾总结（'以上是…'/'我已完成…'），除非结果确实需要解释。"
+)
 
 
 def _extract_text_content(value) -> str:
@@ -41,6 +53,7 @@ async def run_claude(
     model: Optional[str] = None,
     cwd: Optional[str] = None,
     permission_mode: Optional[str] = None,
+    effort: Optional[str] = None,
     on_text_chunk: Optional[Callable[[str], None]] = None,
     on_tool_use: Optional[Callable[[str, dict], None]] = None,
     on_process_start: Optional[Callable[[asyncio.subprocess.Process], None]] = None,
@@ -60,6 +73,8 @@ async def run_claude(
             "--verbose",
             "--include-partial-messages",
             "--permission-mode", permission_mode or PERMISSION_MODE,
+            "--effort", effort or "max",
+            "--append-system-prompt", BRIDGE_SYSTEM_PROMPT,
         ]
         if active_session_id:
             cmd += ["--resume", active_session_id]
@@ -68,6 +83,7 @@ async def run_claude(
 
         env = os.environ.copy()
         env.pop("CLAUDECODE", None)
+        env["FEISHU_BRIDGE_PID"] = str(os.getpid())  # 标记：Claude进程在bridge内运行
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -156,6 +172,51 @@ async def run_claude(
                         pending_tool_name = ""
                         pending_tool_input_json = ""
 
+                elif event_type == "assistant":
+                    # Top-level SDK envelope — emitted by newer CLI versions (2.1.x)
+                    # alongside stream_event. Contains main-agent or subagent output.
+                    # - parent_tool_use_id == null  → main agent
+                    # - parent_tool_use_id is set   → subagent (Agent/Task tool interior)
+                    #
+                    # Main-agent text blocks ALSO arrive via content_block_delta/text_delta;
+                    # firing on_text_chunk here would double the card content. So we do NOT
+                    # forward assistant text to on_text_chunk.
+                    #
+                    # Subagent tool_use blocks are the ONLY signal that a subagent is
+                    # making progress — without firing on_tool_use for these, the card
+                    # has no heartbeat during subagent runs and appears frozen.
+                    parent = data.get("parent_tool_use_id")
+                    is_subagent = parent is not None
+                    if is_subagent:
+                        msg = data.get("message", {})
+                        for block in msg.get("content", []) or []:
+                            btype = block.get("type")
+                            if btype == "tool_use":
+                                sub_name = block.get("name", "")
+                                sub_input = block.get("input", {}) or {}
+                                await _fire_callback(
+                                    on_tool_use,
+                                    f"[subagent] {sub_name}",
+                                    sub_input,
+                                )
+
+                elif event_type == "user":
+                    # Tool_result envelopes. For subagent results, fire a progress
+                    # heartbeat so the card updates as the subagent works through
+                    # multiple tool calls. Main-agent tool_result receipts are
+                    # already implicit in the stream_event flow.
+                    parent = data.get("parent_tool_use_id")
+                    if parent is not None:
+                        await _fire_callback(
+                            on_tool_use,
+                            "[subagent] ⏳",
+                            {},
+                        )
+
+                elif event_type == "rate_limit_event":
+                    # Informational quota status — ignore silently.
+                    pass
+
                 elif event_type == "result":
                     sid = data.get("session_id")
                     if sid:
@@ -163,6 +224,15 @@ async def run_claude(
                     final_text = _extract_text_content(data.get("result", ""))
                     if final_text:
                         full_text = final_text
+
+                else:
+                    # Catch-all: future CLI versions may add new envelope types.
+                    # Log once per unknown type so we can expand handling without
+                    # silently regressing the card-update pipeline.
+                    print(
+                        f"[runner] unknown event_type={event_type!r}",
+                        flush=True,
+                    )
 
         except RuntimeError:
             raise

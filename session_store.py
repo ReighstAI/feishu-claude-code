@@ -8,7 +8,7 @@ import urllib.error
 from datetime import datetime
 from typing import Optional
 
-from bot_config import SESSIONS_DIR, DEFAULT_MODEL, DEFAULT_CWD, PERMISSION_MODE
+from bot_config import SESSIONS_DIR, DEFAULT_MODEL, DEFAULT_CWD, PERMISSION_MODE, DEFAULT_EFFORT
 
 CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 
@@ -278,12 +278,14 @@ class Session:
         cwd: str,
         permission_mode: str,
         workspace: str = "",
+        effort: str = "max",
     ):
         self.session_id = session_id
         self.model = model
         self.cwd = cwd
         self.permission_mode = permission_mode
         self.workspace = workspace
+        self.effort = effort
 
 
 class SessionStore:
@@ -362,6 +364,7 @@ class SessionStore:
             "started_at": datetime.now().isoformat(),
             "preview": "",
             "workspace": "",
+            "effort": DEFAULT_EFFORT,
         }
 
     def _normalize_chat_key(self, user_id: str, chat_id: str) -> str:
@@ -443,6 +446,7 @@ class SessionStore:
             cwd=cur.get("cwd", DEFAULT_CWD),
             permission_mode=cur.get("permission_mode", PERMISSION_MODE),
             workspace=cur.get("workspace", ""),
+            effort=cur.get("effort", DEFAULT_EFFORT),
         )
 
     async def on_claude_response(self, user_id: str, chat_id: str, new_session_id: str, first_message: str):
@@ -503,6 +507,7 @@ class SessionStore:
             "started_at": datetime.now().isoformat(),
             "preview": "",
             "workspace": cur.get("workspace", ""),
+            "effort": cur.get("effort", DEFAULT_EFFORT),
         }
         await self._save_async()
         return old_title
@@ -511,6 +516,12 @@ class SessionStore:
         """Set model for a specific chat"""
         chat_data = await self._ensure_chat_data(user_id, chat_id)
         chat_data["current"]["model"] = model
+        await self._save_async()
+
+    async def set_effort(self, user_id: str, chat_id: str, effort: str):
+        """Set effort level for a specific chat"""
+        chat_data = await self._ensure_chat_data(user_id, chat_id)
+        chat_data["current"]["effort"] = effort
         await self._save_async()
 
     async def set_cwd(self, user_id: str, chat_id: str, cwd: str, workspace_name: Optional[str] = None):

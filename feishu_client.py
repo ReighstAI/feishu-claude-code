@@ -77,11 +77,8 @@ def _card_json(content: str, loading: bool = False) -> str:
             if current_chunk:
                 chunks.append(current_chunk)
 
-            # 为每个块创建 markdown 元素
-            for i, chunk in enumerate(chunks):
-                # 第一块不加前缀，后续块加分段标记
-                if i > 0:
-                    chunk = f"**（续 {i}）**\n\n{chunk}"
+            # 为每个块创建 markdown 元素（无续N标记，自然流动）
+            for chunk in chunks:
                 elements.append({"tag": "markdown", "content": chunk})
 
     return json.dumps({
@@ -230,6 +227,46 @@ class FeishuClient:
 
         return tmp_path
 
+    async def download_file(self, message_id: str, file_key: str, file_name: str = "") -> str:
+        """下载飞书文件（Word/PDF/Excel等）到临时目录，返回本地路径"""
+        return await asyncio.to_thread(
+            self._download_file_sync, message_id, file_key, file_name
+        )
+
+    def _download_file_sync(self, message_id: str, file_key: str, file_name: str = "") -> str:
+        """同步下载文件，在线程池中执行"""
+        import ssl
+        import urllib.request
+        import uuid
+
+        ctx = ssl.create_default_context()
+
+        token_body = json.dumps({"app_id": self._app_id, "app_secret": self._app_secret}).encode()
+        token_req = urllib.request.Request(
+            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+            data=token_body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(token_req, context=ctx, timeout=10) as r:
+            token = json.loads(r.read())["tenant_access_token"]
+
+        url = f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/resources/{file_key}?type=file"
+        file_req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+
+        ext = ""
+        if file_name:
+            _, ext = os.path.splitext(file_name)
+        if not ext:
+            ext = ".bin"
+
+        tmp_path = os.path.join(tempfile.gettempdir(), f"feishu-file-{uuid.uuid4().hex[:8]}{ext}")
+        with urllib.request.urlopen(file_req, context=ctx, timeout=30) as r:
+            with open(tmp_path, "wb") as f:
+                f.write(r.read())
+
+        return tmp_path
+
     async def update_card_with_buttons(self, message_id: str, content: str, buttons: list[dict],
                                       flow: bool = False):
         """更新卡片内容并附加操作按钮。flow=True 时横排自动换行，False 时竖排。"""
@@ -271,12 +308,13 @@ class FeishuClient:
 
         await self._retry_with_backoff(_update, max_retries=3)
 
-    async def update_card_elements(self, message_id: str, elements: list[dict]):
-        """用自定义 elements 列表更新卡片（支持 markdown + button 混排）"""
-        card_content = json.dumps({
-            "schema": "2.0",
-            "body": {"elements": elements},
-        }, ensure_ascii=False)
+    async def update_card_elements(self, message_id: str, elements: list[dict],
+                                   header: dict = None):
+        """用自定义 elements 列表更新卡片（支持 markdown + button 混排 + 可选 header）"""
+        card = {"schema": "2.0", "body": {"elements": elements}}
+        if header:
+            card["header"] = header
+        card_content = json.dumps(card, ensure_ascii=False)
 
         async def _update():
             req = (
@@ -334,3 +372,23 @@ class FeishuClient:
         if not resp.success():
             raise RuntimeError(f"发送文本消息失败: {resp.code} {resp.msg}")
         return resp.data.message_id
+
+    async def add_reaction(self, message_id: str, emoji_type: str):
+        """给消息添加 emoji reaction（如 'PUSHPIN' → 📌）"""
+        from lark_oapi.api.im.v1.model import (
+            CreateMessageReactionRequest,
+            CreateMessageReactionRequestBody,
+        )
+        req = (
+            CreateMessageReactionRequest.builder()
+            .message_id(message_id)
+            .request_body(
+                CreateMessageReactionRequestBody.builder()
+                .reaction_type({"emoji_type": emoji_type})
+                .build()
+            )
+            .build()
+        )
+        resp = await self.client.im.v1.message_reaction.acreate(req)
+        if not resp.success():
+            raise RuntimeError(f"添加 reaction 失败: {resp.code} {resp.msg}")
