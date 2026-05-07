@@ -401,6 +401,7 @@ def _build_card_elements(
     tool_history: list[dict],
     accumulated: str,
     is_final: bool = False,
+    compressed: bool = False,
 ) -> list[dict]:
     """Build CardKit 2.0 element array following PokoClaw's design language.
 
@@ -409,13 +410,21 @@ def _build_card_elements(
     - Prior completed tools collapse into ☕ history panel (blue border)
     - Latest/running tool shows expanded below history
     - Footer: status line below hr
+
+    When compressed=True, tool history is a single text line (no nested panels).
+    Triggered when card exceeds Feishu's 30KB element limit.
     """
     elements = []
     response = _strip_internal(accumulated) if accumulated else ""
 
     # ── Tool section (PokoClaw tool-calls.ts pattern) ──
     if tool_history:
-        if is_final:
+        if compressed:
+            count = len(tool_history)
+            done = sum(1 for t in tool_history if t.get("status") == "completed")
+            label = f"✅ {done}个工具已完成" if done == count else f"⏳ {done}/{count} 个工具"
+            elements.append({"tag": "markdown", "content": label})
+        elif is_final:
             # Final: all tools in collapsed history panel if >2, else individual panels
             if len(tool_history) > 2:
                 elements.append(_render_tool_history_panel(tool_history))
@@ -474,16 +483,33 @@ async def _run_and_display(
     # long subagent runs, so we can afford a more forgiving threshold.
     _PUSH_FAILURE_LIMIT = 10
 
+    _card_compressed = False
+
     async def push_structured():
         """Push structured CardKit 2.0 element array to card."""
-        nonlocal push_failures
+        nonlocal push_failures, _card_compressed
         if push_failures >= _PUSH_FAILURE_LIMIT:
             return
         try:
-            elements = _build_card_elements(tool_history, accumulated, is_final=False)
+            elements = _build_card_elements(
+                tool_history, accumulated, is_final=False, compressed=_card_compressed,
+            )
             await feishu.update_card_elements(card_msg_id, elements)
             push_failures = 0
         except Exception as push_err:
+            err_str = str(push_err)
+            if ("element exceeds the limit" in err_str or "11310" in err_str) and not _card_compressed:
+                _card_compressed = True
+                print("[warn] card too large, compressing tool history and retrying", flush=True)
+                try:
+                    elements = _build_card_elements(
+                        tool_history, accumulated, is_final=False, compressed=True,
+                    )
+                    await feishu.update_card_elements(card_msg_id, elements)
+                    push_failures = 0
+                    return
+                except Exception:
+                    pass
             push_failures += 1
             print(
                 f"[warn] push structured failed ({push_failures}/{_PUSH_FAILURE_LIMIT}): {push_err}",
@@ -688,25 +714,40 @@ async def _run_and_display(
         await feishu.update_card_elements(card_msg_id, elements, header=header)
         card_patched = True
     except Exception as e:
-        print(f"[error] structured card failed, falling back to text: {e}", flush=True)
-        try:
-            plain = final or "（无输出）"
-            await feishu.update_card(card_msg_id, plain)
-            card_patched = True
-        except Exception as e2:
-            print(f"[error] text card also failed, falling back to message: {e2}", flush=True)
-            fallback_content = (
-                "⚠️ 卡片更新失败，以下为本次回复（补发）：\n\n" + (final or "（无输出）")
-            )
+        err_str = str(e)
+        if "element exceeds the limit" in err_str or "11310" in err_str:
+            print("[warn] final card too large, retrying with compressed tools", flush=True)
             try:
-                if is_group and notify_msg_id:
-                    await feishu.reply_card(
-                        notify_msg_id, content=fallback_content, loading=False
-                    )
-                else:
-                    await feishu.send_text_to_user(user_id, fallback_content)
-            except Exception as fallback_err:
-                print(f"[error] all fallbacks failed: {fallback_err}", flush=True)
+                elements = _build_card_elements(tool_history, accumulated, is_final=True, compressed=True)
+                if plan_exited and session.permission_mode == "plan":
+                    elements.append({"tag": "column_set", "flex_mode": "flow", "columns": columns})
+                if not (plan_exited and session.permission_mode == "plan"):
+                    elements.append({"tag": "hr"})
+                    elements.append({"tag": "markdown", "content": "✅ 完成", "text_align": "right", "text_size": "notation"})
+                await feishu.update_card_elements(card_msg_id, elements, header=header)
+                card_patched = True
+            except Exception as e_compressed:
+                print(f"[error] compressed card also failed: {e_compressed}", flush=True)
+        if not card_patched:
+            print(f"[error] structured card failed, falling back to text: {e}", flush=True)
+            try:
+                plain = final or "（无输出）"
+                await feishu.update_card(card_msg_id, plain)
+                card_patched = True
+            except Exception as e2:
+                print(f"[error] text card also failed, falling back to message: {e2}", flush=True)
+                fallback_content = (
+                    "⚠️ 卡片更新失败，以下为本次回复（补发）：\n\n" + (final or "（无输出）")
+                )
+                try:
+                    if is_group and notify_msg_id:
+                        await feishu.reply_card(
+                            notify_msg_id, content=fallback_content, loading=False
+                        )
+                    else:
+                        await feishu.send_text_to_user(user_id, fallback_content)
+                except Exception as fallback_err:
+                    print(f"[error] all fallbacks failed: {fallback_err}", flush=True)
 
     # No standalone ✅ message — card header IS the completion signal
 
@@ -804,7 +845,7 @@ async def _dispatch_messages(msgs: list):
 async def _transcribe_audio(audio_path: str, timeout_s: int = 60) -> str:
     """调用 scripts/feishu-audio-transcribe.py（用 system python3 + faster-whisper）转写语音。
     返回纯文本 transcript；失败返回 ""。超时/异常都吞掉，不阻塞 bridge。"""
-    workspace = os.path.expanduser("~/Reighst Claude")
+    workspace = config.DEFAULT_CWD
     script = os.path.join(workspace, "scripts", "feishu-audio-transcribe.py")
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -1262,7 +1303,12 @@ def _extract_options(text: str) -> list[tuple[str, str]]:
 
 def _shorten_path(path: str) -> str:
     """Strip workspace prefix from paths for cleaner display."""
-    return path.replace('/Users/reights/Reighst Claude/', '').replace('/Users/reights/', '~/')
+    home = os.path.expanduser("~")
+    cwd = config.DEFAULT_CWD
+    # Strip workspace first (more specific), then home
+    if cwd and cwd != home:
+        path = path.replace(cwd + '/', '').replace(cwd, '')
+    return path.replace(home + '/', '~/').replace(home, '~')
 
 
 def _build_tool_object(name: str, inp: dict) -> dict:
@@ -1272,7 +1318,7 @@ def _build_tool_object(name: str, inp: dict) -> dict:
 
     if n == "bash":
         cmd = inp.get("command", "")
-        cmd_clean = re.sub(r'^cd\s+"[^"]*Reighst Claude[^"]*"\s*&&\s*', '', cmd)
+        cmd_clean = re.sub(r'^cd\s+"[^"]*"\s*&&\s*', '', cmd)
         obj["name"] = "bash"
         obj["summary"] = cmd_clean[:80] + "..." if len(cmd_clean) > 80 else cmd_clean
         if cmd:
@@ -1490,7 +1536,7 @@ async def _handle_resume_session(user_id: str, chat_id: str, session_id: str, ca
 
 
 async def _handle_plan_approve(user_id: str, chat_id: str, card_msg_id: str):
-    """Carter 批准方案 → 切换到执行模式 + 自动开始"""
+    """用户批准方案 → 切换到执行模式 + 自动开始"""
     await store.set_permission_mode(user_id, chat_id, "bypassPermissions")
     print(f"[Plan] approved, switching to bypassPermissions", flush=True)
 
@@ -1520,14 +1566,14 @@ async def _handle_plan_approve(user_id: str, chat_id: str, card_msg_id: str):
 
 
 async def _handle_plan_revise(user_id: str, chat_id: str, card_msg_id: str):
-    """Carter 要修改方案 → 更新卡片，等待文字反馈"""
+    """用户要修改方案 → 更新卡片，等待文字反馈"""
     print(f"[Plan] revision requested", flush=True)
     if card_msg_id:
         try:
             await feishu.update_card(card_msg_id, "✏️ 请发送修改意见，我会据此修改方案。")
         except Exception:
             pass
-    # Stay in plan mode. Carter's next text → Claude revises → ExitPlanMode → cycle repeats.
+    # Stay in plan mode. User's next text → Claude revises → ExitPlanMode → cycle repeats.
 
 
 async def _handle_set_mode(user_id: str, chat_id: str, mode: str, card_msg_id: str):
