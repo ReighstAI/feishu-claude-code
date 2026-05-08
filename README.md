@@ -41,7 +41,7 @@ WebSocket 长连接，流式卡片输出，手机上随时 code review、debug�
 ### 安装与启动
 
 ```bash
-git clone https://github.com/joewongjc/feishu-claude-code.git
+git clone https://github.com/ReighstAI/feishu-claude-code.git
 cd feishu-claude-code
 
 python3 -m venv .venv
