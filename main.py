@@ -529,6 +529,7 @@ async def _run_and_display(
         if name.lower() == "enterplanmode":
             if session.permission_mode != "plan":
                 print(f"[Plan] EnterPlanMode 检测到，切换为 plan", flush=True)
+                session.permission_mode = "plan"
                 await store.set_permission_mode(user_id, chat_id, "plan")
             return
         if name.lower() == "enterworktree" and inp:
@@ -741,6 +742,15 @@ async def _run_and_display(
             print("[warn] final card too large, retrying with compressed tools", flush=True)
             try:
                 elements = _build_card_elements(tool_history, accumulated, is_final=True, compressed=True)
+                # Re-insert plan doc link (lost when elements were rebuilt)
+                if plan_doc_url:
+                    plan_link = {"tag": "markdown", "content": f"📋 [点击查看完整方案]({plan_doc_url})"}
+                    insert_idx = 0
+                    for i, el in enumerate(elements):
+                        if el.get("tag") == "hr":
+                            insert_idx = i + 1
+                            break
+                    elements.insert(insert_idx, plan_link)
                 if plan_exited and session.permission_mode == "plan":
                     elements.append({"tag": "column_set", "flex_mode": "flow", "columns": columns})
                 if not (plan_exited and session.permission_mode == "plan"):
