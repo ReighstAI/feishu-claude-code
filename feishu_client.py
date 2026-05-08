@@ -1,6 +1,8 @@
 """
 飞书 API 异步封装。
-流式方案：发送内联卡片消息 → 用 patch 逐步更新内容（比 cardkit 流式卡片更简单可靠）。
+流式方案：发送内联卡片消息 → 用 patch 逐步更新内容。
+CardKit streaming 方法已就绪（create_streaming_card / update_streaming_card），
+待 sequence reconcile 实现后启用。
 """
 
 import asyncio
@@ -454,3 +456,93 @@ class FeishuClient:
             return f"https://{feishu_domain}.feishu.cn/docx/{doc_id}"
 
         return await asyncio.to_thread(_create_sync)
+
+    # ── CardKit Streaming ─────────────────────────────────────
+
+    async def create_streaming_card(self, open_id: str, card_json: str,
+                                     reply_to: str = "") -> tuple[str, str]:
+        """创建 CardKit 卡片实体 + 发消息引用。返回 (card_id, message_id)。
+
+        card_json 必须包含 streaming_mode: true。
+        reply_to 非空时回复该消息（群聊场景），否则私聊发送。
+        """
+        from lark_oapi.api.cardkit.v1.model import (
+            CreateCardRequest, CreateCardRequestBody,
+        )
+
+        def _create_card_sync() -> str:
+            req = (
+                CreateCardRequest.builder()
+                .request_body(
+                    CreateCardRequestBody.builder()
+                    .type("card_json")
+                    .data(card_json)
+                    .build()
+                )
+                .build()
+            )
+            resp = self.client.cardkit.v1.card.create(req)
+            if not resp.success():
+                raise RuntimeError(f"创建 CardKit 卡片失败: {resp.code} {resp.msg}")
+            return resp.data.card_id
+
+        card_id = await asyncio.to_thread(_create_card_sync)
+
+        # 发消息引用 card_id
+        msg_content = json.dumps({"type": "card", "data": {"card_id": card_id}})
+        if reply_to:
+            req = (
+                ReplyMessageRequest.builder()
+                .message_id(reply_to)
+                .request_body(
+                    ReplyMessageRequestBody.builder()
+                    .msg_type("interactive")
+                    .content(msg_content)
+                    .build()
+                )
+                .build()
+            )
+            resp = await self.client.im.v1.message.areply(req)
+        else:
+            req = (
+                CreateMessageRequest.builder()
+                .receive_id_type("open_id")
+                .request_body(
+                    CreateMessageRequestBody.builder()
+                    .receive_id(open_id)
+                    .msg_type("interactive")
+                    .content(msg_content)
+                    .build()
+                )
+                .build()
+            )
+            resp = await self.client.im.v1.message.acreate(req)
+
+        if not resp.success():
+            raise RuntimeError(f"发送 CardKit 引用消息失败: {resp.code} {resp.msg}")
+        return card_id, resp.data.message_id
+
+    async def update_streaming_card(self, card_id: str, card_json: str, sequence: int):
+        """CardKit card.update — 全量替换卡片内容（streaming_mode 下客户端只动画 diff）"""
+        from lark_oapi.api.cardkit.v1.model import (
+            UpdateCardRequest, UpdateCardRequestBody, Card,
+        )
+
+        def _update_sync():
+            card_obj = Card.builder().type("card_json").data(card_json).build()
+            req = (
+                UpdateCardRequest.builder()
+                .card_id(card_id)
+                .request_body(
+                    UpdateCardRequestBody.builder()
+                    .card(card_obj)
+                    .sequence(sequence)
+                    .build()
+                )
+                .build()
+            )
+            resp = self.client.cardkit.v1.card.update(req)
+            if not resp.success():
+                raise RuntimeError(f"CardKit update 失败: {resp.code} {resp.msg}")
+
+        await asyncio.to_thread(_update_sync)
