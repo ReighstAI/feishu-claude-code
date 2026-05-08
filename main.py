@@ -1400,7 +1400,7 @@ def _format_tool(name: str, inp: dict) -> str:
     if n == "bash":
         cmd = inp.get("command", "")
         # Strip cd to workspace prefix
-        cmd = re.sub(rf'^cd\s+"{re.escape(config.DEFAULT_CWD)}"\s*&&\s*', '', cmd)
+        cmd = cmd.removeprefix(f'cd "{config.DEFAULT_CWD}" && ')
         if len(cmd) > 60:
             cmd = cmd[:57] + "..."
         return f"🔧 `{cmd}`" if cmd else "🔧 执行命令..."
