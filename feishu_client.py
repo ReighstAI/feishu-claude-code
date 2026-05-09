@@ -546,3 +546,88 @@ class FeishuClient:
                 raise RuntimeError(f"CardKit update 失败: {resp.code} {resp.msg}")
 
         await asyncio.to_thread(_update_sync)
+
+    async def update_element_content(self, card_id: str, element_id: str,
+                                      content: str, sequence: int):
+        """cardElement.content — 增量更新单个 element 的 markdown 内容。
+        触发客户端打字机动画的关键 API。"""
+        from lark_oapi.api.cardkit.v1.model import (
+            ContentCardElementRequest, ContentCardElementRequestBody,
+        )
+
+        def _content_sync():
+            req = (
+                ContentCardElementRequest.builder()
+                .card_id(card_id)
+                .element_id(element_id)
+                .request_body(
+                    ContentCardElementRequestBody.builder()
+                    .content(content)
+                    .sequence(sequence)
+                    .build()
+                )
+                .build()
+            )
+            resp = self.client.cardkit.v1.card_element.content(req)
+            if not resp.success():
+                raise RuntimeError(f"CardKit element content 失败: {resp.code} {resp.msg}")
+
+        await asyncio.to_thread(_content_sync)
+
+    async def close_streaming(self, card_id: str, sequence: int):
+        """card.settings — 关闭 streaming_mode，锁定卡片为静态"""
+        from lark_oapi.api.cardkit.v1.model import (
+            SettingsCardRequest, SettingsCardRequestBody,
+        )
+
+        settings_json = json.dumps({"config": {"streaming_mode": False}})
+
+        def _settings_sync():
+            req = (
+                SettingsCardRequest.builder()
+                .card_id(card_id)
+                .request_body(
+                    SettingsCardRequestBody.builder()
+                    .settings(settings_json)
+                    .sequence(sequence)
+                    .build()
+                )
+                .build()
+            )
+            resp = self.client.cardkit.v1.card.settings(req)
+            if not resp.success():
+                raise RuntimeError(f"CardKit close streaming 失败: {resp.code} {resp.msg}")
+
+        await asyncio.to_thread(_settings_sync)
+
+    async def cardkit_call_with_reconcile(
+        self, card_id: str, sequence: int,
+        call_fn,
+        max_retries: int = 3,
+    ) -> int:
+        """Sequence reconcile 包装器。
+        成功 → 返回 sequence+1
+        300317 → 提取正确 sequence 重试
+        300308 → backoff 重试
+        超限 → raise（让调用者降级到 message.patch）
+        """
+        for attempt in range(max_retries):
+            try:
+                await call_fn(sequence)
+                return sequence + 1
+            except RuntimeError as e:
+                err = str(e)
+                if "300317" in err:
+                    # sequence desync — 尝试用 sequence+1 重试
+                    sequence += 1
+                    print(f"[CardKit] 300317 sequence desync, 重试 seq={sequence}", flush=True)
+                    continue
+                elif "300308" in err:
+                    # server error — backoff
+                    wait = 0.5 * (attempt + 1)
+                    print(f"[CardKit] 300308 server error, {wait}s 后重试", flush=True)
+                    await asyncio.sleep(wait)
+                    continue
+                else:
+                    raise
+        raise RuntimeError(f"CardKit reconcile 失败，{max_retries} 次重试后放弃")

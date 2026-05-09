@@ -101,7 +101,14 @@ def _card_header(state: str) -> dict | None:
 async def _announce_stopped_run(active_run: ActiveRun):
     try:
         elements = [{"tag": "markdown", "content": "⏹ 已停止当前任务"}]
-        await feishu.update_card_elements(active_run.card_msg_id, elements, header=_card_header("interrupted"))
+        if active_run.use_cardkit and active_run.cardkit_card_id:
+            card_json = json.dumps({"schema": "2.0", "header": _card_header("interrupted"),
+                                    "body": {"elements": elements}}, ensure_ascii=False)
+            seq = active_run.cardkit_sequence + 1
+            await feishu.update_streaming_card(active_run.cardkit_card_id, card_json, seq)
+            await feishu.close_streaming(active_run.cardkit_card_id, seq + 1)
+        else:
+            await feishu.update_card_elements(active_run.card_msg_id, elements, header=_card_header("interrupted"))
     except Exception:
         try:
             await feishu.update_card(active_run.card_msg_id, "⏹ 已停止当前任务")
@@ -112,7 +119,14 @@ async def _announce_stopped_run(active_run: ActiveRun):
 async def _announce_interrupted(active_run: ActiveRun):
     try:
         elements = [{"tag": "markdown", "content": "⏹ 已被新消息打断"}]
-        await feishu.update_card_elements(active_run.card_msg_id, elements, header=_card_header("interrupted"))
+        if active_run.use_cardkit and active_run.cardkit_card_id:
+            card_json = json.dumps({"schema": "2.0", "header": _card_header("interrupted"),
+                                    "body": {"elements": elements}}, ensure_ascii=False)
+            seq = active_run.cardkit_sequence + 1
+            await feishu.update_streaming_card(active_run.cardkit_card_id, card_json, seq)
+            await feishu.close_streaming(active_run.cardkit_card_id, seq + 1)
+        else:
+            await feishu.update_card_elements(active_run.card_msg_id, elements, header=_card_header("interrupted"))
     except Exception:
         try:
             await feishu.update_card(active_run.card_msg_id, "⏹ 已被新消息打断")
@@ -464,9 +478,12 @@ def _build_card_elements(
 async def _run_and_display(
     user_id: str, chat_id: str, is_group: bool,
     text: str, card_msg_id: str, session, notify_msg_id: str,
+    cardkit_card_id: str = "", use_cardkit: bool = False,
 ):
     """调用 Claude 并流式展示结果，检测选项时附加按钮。消息处理和按钮回复共用此函数。"""
     active_run = _active_runs.start_run(user_id, card_msg_id)
+    active_run.cardkit_card_id = cardkit_card_id
+    active_run.use_cardkit = use_cardkit
 
     accumulated = ""
     tool_history: list[dict] = []  # structured: {name, summary, detail, status}
@@ -484,12 +501,64 @@ async def _run_and_display(
     _PUSH_FAILURE_LIMIT = 10
 
     _card_compressed = False
+    _cardkit_seq = 1
+    _ck_registered = False  # element_id registered after first card.update
+    _ck_last_tool_count = 0
 
     async def push_structured():
-        """Push structured CardKit 2.0 element array to card."""
-        nonlocal push_failures, _card_compressed
+        """Push card update. CardKit dual-path or message.patch fallback."""
+        nonlocal push_failures, _card_compressed, use_cardkit, _cardkit_seq
+        nonlocal _ck_registered, _ck_last_tool_count
         if push_failures >= _PUSH_FAILURE_LIMIT:
             return
+
+        # ── CardKit streaming ──
+        if use_cardkit:
+            tc = len(tool_history)
+            try:
+                if _ck_registered and tc == _ck_last_tool_count and accumulated.strip():
+                    # Text only → cardElement.content (typewriter animation)
+                    _cardkit_seq = await feishu.cardkit_call_with_reconcile(
+                        cardkit_card_id, _cardkit_seq,
+                        lambda seq: feishu.update_element_content(
+                            cardkit_card_id, "st", accumulated, seq),
+                    )
+                else:
+                    # Structure change or first push → card.update (registers element_id)
+                    elements = _build_card_elements(
+                        tool_history, accumulated, is_final=False, compressed=_card_compressed,
+                    )
+                    # Tag the response text element (skip footer/hr at the end)
+                    tagged = False
+                    for i in range(len(elements) - 1, -1, -1):
+                        el = elements[i]
+                        if el.get("tag") == "hr":
+                            continue
+                        if el.get("tag") == "markdown":
+                            c = el.get("content", "")
+                            if c.startswith(("🧠", "🧰", "⏳")):
+                                continue
+                            el["element_id"] = "st"
+                            tagged = True
+                            break
+                    cj = json.dumps({"schema": "2.0", "config": {"streaming_mode": True},
+                                     "body": {"elements": elements}}, ensure_ascii=False)
+                    _cardkit_seq = await feishu.cardkit_call_with_reconcile(
+                        cardkit_card_id, _cardkit_seq,
+                        lambda seq: feishu.update_streaming_card(cardkit_card_id, cj, seq),
+                    )
+                    if tagged:
+                        _ck_registered = True
+                    _ck_last_tool_count = tc
+                active_run.cardkit_sequence = _cardkit_seq
+                push_failures = 0
+                return
+            except Exception as e:
+                print(f"[CardKit] degrading to message.patch: {e}", flush=True)
+                use_cardkit = False
+                active_run.use_cardkit = False
+
+        # ── message.patch fallback (current stable mode) ──
         try:
             elements = _build_card_elements(
                 tool_history, accumulated, is_final=False, compressed=_card_compressed,
@@ -733,53 +802,73 @@ async def _run_and_display(
 
     # Try structured card, fall back to plain text
     card_patched = False
-    try:
-        await feishu.update_card_elements(card_msg_id, elements, header=header)
-        card_patched = True
-    except Exception as e:
-        err_str = str(e)
-        if "element exceeds the limit" in err_str or "11310" in err_str:
-            print("[warn] final card too large, retrying with compressed tools", flush=True)
-            try:
-                elements = _build_card_elements(tool_history, accumulated, is_final=True, compressed=True)
-                # Re-insert plan doc link (lost when elements were rebuilt)
-                if plan_doc_url:
-                    plan_link = {"tag": "markdown", "content": f"📋 [点击查看完整方案]({plan_doc_url})"}
-                    insert_idx = 0
-                    for i, el in enumerate(elements):
-                        if el.get("tag") == "hr":
-                            insert_idx = i + 1
-                            break
-                    elements.insert(insert_idx, plan_link)
-                if plan_exited and session.permission_mode == "plan":
-                    elements.append({"tag": "column_set", "flex_mode": "flow", "columns": columns})
-                if not (plan_exited and session.permission_mode == "plan"):
-                    elements.append({"tag": "hr"})
-                    elements.append({"tag": "markdown", "content": "✅ 完成", "text_align": "right", "text_size": "notation"})
-                await feishu.update_card_elements(card_msg_id, elements, header=header)
-                card_patched = True
-            except Exception as e_compressed:
-                print(f"[error] compressed card also failed: {e_compressed}", flush=True)
-        if not card_patched:
-            print(f"[error] structured card failed, falling back to text: {e}", flush=True)
-            try:
-                plain = final or "（无输出）"
-                await feishu.update_card(card_msg_id, plain)
-                card_patched = True
-            except Exception as e2:
-                print(f"[error] text card also failed, falling back to message: {e2}", flush=True)
-                fallback_content = (
-                    "⚠️ 卡片更新失败，以下为本次回复（补发）：\n\n" + (final or "（无输出）")
-                )
+
+    # CardKit final: send final card + close streaming
+    if use_cardkit:
+        try:
+            final_card = {"schema": "2.0", "body": {"elements": elements}}
+            if header:
+                final_card["header"] = header
+            _cardkit_seq = await feishu.cardkit_call_with_reconcile(
+                cardkit_card_id, _cardkit_seq,
+                lambda seq: feishu.update_streaming_card(
+                    cardkit_card_id, json.dumps(final_card, ensure_ascii=False), seq),
+            )
+            await feishu.close_streaming(cardkit_card_id, _cardkit_seq)
+            card_patched = True
+        except Exception as e:
+            print(f"[CardKit] final update failed, falling back to message.patch: {e}", flush=True)
+            use_cardkit = False
+            active_run.use_cardkit = False
+
+    if not card_patched:
+        try:
+            await feishu.update_card_elements(card_msg_id, elements, header=header)
+            card_patched = True
+        except Exception as e:
+            err_str = str(e)
+            if "element exceeds the limit" in err_str or "11310" in err_str:
+                print("[warn] final card too large, retrying with compressed tools", flush=True)
                 try:
-                    if is_group and notify_msg_id:
-                        await feishu.reply_card(
-                            notify_msg_id, content=fallback_content, loading=False
-                        )
-                    else:
-                        await feishu.send_text_to_user(user_id, fallback_content)
-                except Exception as fallback_err:
-                    print(f"[error] all fallbacks failed: {fallback_err}", flush=True)
+                    elements = _build_card_elements(tool_history, accumulated, is_final=True, compressed=True)
+                    # Re-insert plan doc link (lost when elements were rebuilt)
+                    if plan_doc_url:
+                        plan_link = {"tag": "markdown", "content": f"📋 [点击查看完整方案]({plan_doc_url})"}
+                        insert_idx = 0
+                        for i, el in enumerate(elements):
+                            if el.get("tag") == "hr":
+                                insert_idx = i + 1
+                                break
+                        elements.insert(insert_idx, plan_link)
+                    if plan_exited and session.permission_mode == "plan":
+                        elements.append({"tag": "column_set", "flex_mode": "flow", "columns": columns})
+                    if not (plan_exited and session.permission_mode == "plan"):
+                        elements.append({"tag": "hr"})
+                        elements.append({"tag": "markdown", "content": "✅ 完成", "text_align": "right", "text_size": "notation"})
+                    await feishu.update_card_elements(card_msg_id, elements, header=header)
+                    card_patched = True
+                except Exception as e_compressed:
+                    print(f"[error] compressed card also failed: {e_compressed}", flush=True)
+            if not card_patched:
+                print(f"[error] structured card failed, falling back to text: {e}", flush=True)
+                try:
+                    plain = final or "（无输出）"
+                    await feishu.update_card(card_msg_id, plain)
+                    card_patched = True
+                except Exception as e2:
+                    print(f"[error] text card also failed, falling back to message: {e2}", flush=True)
+                    fallback_content = (
+                        "⚠️ 卡片更新失败，以下为本次回复（补发）：\n\n" + (final or "（无输出）")
+                    )
+                    try:
+                        if is_group and notify_msg_id:
+                            await feishu.reply_card(
+                                notify_msg_id, content=fallback_content, loading=False
+                            )
+                        else:
+                            await feishu.send_text_to_user(user_id, fallback_content)
+                    except Exception as fallback_err:
+                        print(f"[error] all fallbacks failed: {fallback_err}", flush=True)
 
     # No standalone ✅ message — card header IS the completion signal
 
@@ -804,8 +893,21 @@ async def _auto_dispatch_btw(user_id: str, chat_id: str, is_group: bool, text: s
     async with _chat_locks[chat_id]:
         try:
             session = await store.get_current(user_id, chat_id)
-            card = await feishu.send_card_to_user(user_id, loading=True)
-            await _run_and_display(user_id, chat_id, is_group, text, card, session, "")
+            cardkit_id, ck_flag = "", False
+            try:
+                initial = json.dumps({
+                    "schema": "2.0",
+                    "config": {"streaming_mode": True,
+                               "streaming_config": {"print_frequency_ms": {"default": 50}, "print_step": {"default": 2}},
+                               "summary": {"content": "⏳ 思考中..."}},
+                    "body": {"elements": [{"tag": "markdown", "content": "⏳ 思考中...", "element_id": "streaming_text"}]},
+                }, ensure_ascii=False)
+                cardkit_id, card = await feishu.create_streaming_card(user_id, initial)
+                ck_flag = True
+            except Exception:
+                card = await feishu.send_card_to_user(user_id, loading=True)
+            await _run_and_display(user_id, chat_id, is_group, text, card, session, "",
+                                   cardkit_card_id=cardkit_id, use_cardkit=ck_flag)
         except Exception as e:
             print(f"[btw] auto-dispatch failed: {e}", flush=True)
 
@@ -1041,16 +1143,35 @@ async def _process_bundled_messages(user_id: str, chat_id: str, is_group: bool, 
 
     session = await store.get_current(user_id, chat_id)
 
+    cardkit_card_id = ""
+    use_cardkit_flag = False
     try:
-        if is_group:
-            card_msg_id = await feishu.reply_card(first_msg_id, loading=True)
-        else:
-            card_msg_id = await feishu.send_card_to_user(user_id, loading=True)
-    except Exception as e:
-        print(f"[error] 发送占位卡片失败: {e}", flush=True)
-        return
+        initial = json.dumps({
+            "schema": "2.0",
+            "config": {
+                "streaming_mode": True,
+                "streaming_config": {"print_frequency_ms": {"default": 50}, "print_step": {"default": 2}},
+                "summary": {"content": "⏳ 思考中..."},
+            },
+            "body": {"elements": [
+                {"tag": "markdown", "content": "⏳ 思考中...", "element_id": "streaming_text"}
+            ]},
+        }, ensure_ascii=False)
+        reply_to = first_msg_id if is_group else ""
+        cardkit_card_id, card_msg_id = await feishu.create_streaming_card(user_id, initial, reply_to=reply_to)
+        use_cardkit_flag = True
+    except Exception:
+        try:
+            if is_group:
+                card_msg_id = await feishu.reply_card(first_msg_id, loading=True)
+            else:
+                card_msg_id = await feishu.send_card_to_user(user_id, loading=True)
+        except Exception as e:
+            print(f"[error] 发送占位卡片失败: {e}", flush=True)
+            return
 
-    await _run_and_display(user_id, chat_id, is_group, combined, card_msg_id, session, first_msg_id)
+    await _run_and_display(user_id, chat_id, is_group, combined, card_msg_id, session, first_msg_id,
+                           cardkit_card_id=cardkit_card_id, use_cardkit=use_cardkit_flag)
 
 
 async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
@@ -1277,25 +1398,46 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
     session = await store.get_current(user_id, chat_id)
     print(f"[Claude] session={session.session_id} model={session.model}", flush=True)
 
-    # 1. 发送"思考中"占位卡片，拿到 message_id
+    # 1. 发送占位卡片 — 优先 CardKit streaming，失败回退 inline card
+    cardkit_card_id = ""
+    use_cardkit_flag = False
     try:
-        if is_group:
-            card_msg_id = await feishu.reply_card(msg.message_id, loading=True)
-        else:
-            card_msg_id = await feishu.send_card_to_user(user_id, loading=True)
-        print(f"[卡片] card_msg_id={card_msg_id}", flush=True)
-    except Exception as e:
-        print(f"[error] 发送占位卡片失败: {e}", flush=True)
-        if is_group:
-            try:
-                await feishu.reply_card(msg.message_id, content=f"❌ 发送消息失败：{e}", loading=False)
-            except Exception:
-                pass
-        else:
-            await feishu.send_text_to_user(user_id, f"❌ 发送消息失败：{e}")
-        return
+        initial = json.dumps({
+            "schema": "2.0",
+            "config": {
+                "streaming_mode": True,
+                "streaming_config": {"print_frequency_ms": {"default": 50}, "print_step": {"default": 2}},
+                "summary": {"content": "⏳ 思考中..."},
+            },
+            "body": {"elements": [
+                {"tag": "markdown", "content": "⏳ 思考中...", "element_id": "streaming_text"}
+            ]},
+        }, ensure_ascii=False)
+        reply_to = msg.message_id if is_group else ""
+        cardkit_card_id, card_msg_id = await feishu.create_streaming_card(user_id, initial, reply_to=reply_to)
+        use_cardkit_flag = True
+        print(f"[CardKit] streaming card created: {cardkit_card_id}", flush=True)
+    except Exception as ck_err:
+        print(f"[CardKit] create failed, using inline card: {ck_err}", flush=True)
+        try:
+            if is_group:
+                card_msg_id = await feishu.reply_card(msg.message_id, loading=True)
+            else:
+                card_msg_id = await feishu.send_card_to_user(user_id, loading=True)
+        except Exception as e:
+            print(f"[error] 发送占位卡片失败: {e}", flush=True)
+            if is_group:
+                try:
+                    await feishu.reply_card(msg.message_id, content=f"❌ 发送消息失败：{e}", loading=False)
+                except Exception:
+                    pass
+            else:
+                await feishu.send_text_to_user(user_id, f"❌ 发送消息失败：{e}")
+            return
+    print(f"[卡片] card_msg_id={card_msg_id}", flush=True)
 
-    await _run_and_display(user_id, chat_id, is_group, text, card_msg_id, session, msg.message_id)
+    await _run_and_display(user_id, chat_id, is_group, text, card_msg_id, session, msg.message_id,
+                           cardkit_card_id=cardkit_card_id, use_cardkit=use_cardkit_flag)
 
 
 def _extract_options(text: str) -> list[tuple[str, str]]:
