@@ -10,6 +10,9 @@ class ActiveRun:
     proc: object | None = None
     stop_requested: bool = False
     stop_announced: bool = False
+    cardkit_card_id: str = ""
+    cardkit_sequence: int = 0
+    use_cardkit: bool = False
 
 
 class ActiveRunRegistry:
